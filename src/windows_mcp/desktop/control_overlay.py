@@ -15,12 +15,9 @@ from windows_mcp.desktop import flash_overlay
 from windows_mcp.desktop.control_overlay_art import (
     _BORDER,
     _CURSOR_SIZE,
-    _NOTICE_GLOW_PAD,
     _breath_opacity,
-    _cursor_bitmap,
     _edge_bitmap,
     _notice_bitmap,
-    _notice_glow_bitmap,
 )
 from windows_mcp import uia
 
@@ -136,7 +133,7 @@ def _monitor_rects() -> tuple[tuple[int, int, int, int], ...]:
 
 def _build_layers(
     rects: tuple[tuple[int, int, int, int], ...], pending: bool
-) -> tuple[list[_Layer], _Layer]:
+) -> tuple[list[_Layer], _Layer | None]:
     if not rects:
         raise RuntimeError("no display available for AI control indicator")
     color = _AMBER if pending else _BLUE
@@ -165,22 +162,10 @@ def _build_layers(
             notice = _notice_bitmap(width)
             if notice is not None:
                 notice_width, notice_height, bitmap = notice
-                # Narrow monitors retain the aura without letting its window spill onto a neighbor.
-                glow_pad = min(_NOTICE_GLOW_PAD, (width - notice_width) // 2)
-                if height <= border + notice_height + 2 * glow_pad:
+                if height <= notice_height + 16:
                     continue
                 notice_x = left + (width - notice_width) // 2
-                notice_y = top + border + glow_pad
-                layers.append(
-                    _Layer(
-                        notice_x - glow_pad,
-                        notice_y - glow_pad,
-                        notice_width + 2 * glow_pad,
-                        notice_height + 2 * glow_pad,
-                        _notice_glow_bitmap(notice_width, notice_height, color, glow_pad),
-                        f"{index}_notice_glow",
-                    )
-                )
+                notice_y = top + 8
                 layers.append(
                     _Layer(
                         notice_x,
@@ -192,18 +177,7 @@ def _build_layers(
                         breathes=False,
                     )
                 )
-        point = wintypes.POINT()
-        if not _user32.GetCursorPos(ctypes.byref(point)):
-            raise RuntimeError("cannot locate cursor for AI control indicator")
-        ring = _Layer(
-            point.x - _CURSOR_SIZE // 2,
-            point.y - _CURSOR_SIZE // 2,
-            _CURSOR_SIZE,
-            _CURSOR_SIZE,
-            _cursor_bitmap(color),
-            "cursor",
-        )
-        return layers, ring
+        return layers, None
     except BaseException:
         for layer in reversed(layers):
             layer.close()
@@ -318,7 +292,7 @@ class _Indicator:
                     if not was_active:
                         breath_started = time.monotonic()
                     current_rects = _monitor_rects()
-                    if ring is None or current_rects != rects or mode != pending:
+                    if not layers or current_rects != rects or mode != pending:
                         for layer in reversed(layers):
                             layer.close()
                         layers = []
@@ -332,26 +306,27 @@ class _Indicator:
                         if visible:
                             for layer in layers:
                                 layer.hide()
-                            ring.hide()
+                            if ring:
+                                ring.hide()
                             visible = False
                     else:
                         opacity = _breath_opacity(time.monotonic() - breath_started)
                         for layer in layers:
                             if layer.breathes:
                                 layer.set_opacity(opacity)
-                        if not pending:
+                        if not pending and ring:
                             ring.set_opacity(opacity)
                         if not visible:
                             for layer in layers:
                                 layer.show()
-                            if not pending:
+                            if not pending and ring:
                                 ring.show()
                             visible = True
-                        if not pending:
+                        if not pending and ring:
                             point = wintypes.POINT()
                             if _user32.GetCursorPos(ctypes.byref(point)):
                                 ring.move(point.x - _CURSOR_SIZE // 2, point.y - _CURSOR_SIZE // 2)
-                        else:
+                        elif ring:
                             ring.hide()
                 elif visible:
                     for layer in layers:

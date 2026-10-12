@@ -27,7 +27,7 @@ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
             return _user32.CallNextHookEx(owner._mouse_hook, code, wparam, lparam)
         valid = True
         owner._last_physical_event = time.monotonic()
-        if wparam == 0x200 and owner._suppress:
+        if wparam == 0x200 and owner._suppress and not owner.immediate_capture:
             owner._fast_pending = True  # Pause AI before queued movement is processed.
             owner.input_ledger.block_new()
         button = _mouse_button(wparam, data.mouseData)
@@ -39,6 +39,10 @@ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
         owner._queue(("point", data.pt.x, data.pt.y, int(wparam)))
         if owner._suppress and not owner._emergency:
             if time.monotonic() <= owner._deadline:
+                # Pair a physical press delivered before takeover with its up.
+                if button and not button[1] and button[0] in owner._delivered_mouse:
+                    owner._delivered_mouse.discard(button[0])
+                    return _user32.CallNextHookEx(owner._mouse_hook, code, wparam, lparam)
                 return 1
             owner._fail_open()
     except Exception:
@@ -74,8 +78,17 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
                 owner._quarantine.discard(vk)
                 owner._queue(("key",))  # Idle starts after the last chord key is released.
             return 1
+        if down and vk == 0x1B and (owner._suppress or owner._visual_paused or owner._state == "ai"):
+            owner._quarantine.add(vk)
+            owner._escape_cancelled = True
+            owner._fast_takeover = True
+            owner._suppress = False
+            owner.input_ledger.block_new()
+            owner._queue(("escape",))
+            return 1
         if (
-            down
+            not owner.immediate_capture
+            and down
             and vk == 0x08
             and not was_down
             and not owner._fast_takeover
@@ -91,6 +104,9 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
         owner._queue(("key",))
         if owner._suppress and not owner._emergency:
             if time.monotonic() <= owner._deadline:
+                if not down and vk in owner._delivered_keys:
+                    owner._delivered_keys.discard(vk)
+                    return _user32.CallNextHookEx(owner._key_hook, code, wparam, lparam)
                 return 1
             owner._fail_open()
     except Exception:
@@ -108,7 +124,7 @@ def raw_input(owner: Any, lparam: int) -> None:
     if raw is None:
         return  # Null devices can be touchpads; do not infer source.
     owner._last_physical_event = time.monotonic()
-    if owner._suppress:
+    if owner._suppress and not owner.immediate_capture:
         owner._fast_pending = True
         owner.input_ledger.block_new()
     owner._queue(("raw", *raw))

@@ -43,6 +43,7 @@ class ControlConfig:
     # Raw relative device units and hook screen pixels are intentionally separate.
     mouse_takeover_units: int = 120
     mouse_takeover_pixels: int = 120
+    immediate_capture: bool = True
 
 
 @dataclass
@@ -163,6 +164,8 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     if "exclude" in tools:
         cfg.tools.exclude = _list_of_strings(tools["exclude"], "tools.exclude")
 
+    if "immediate_capture" in control:
+        cfg.control.immediate_capture = _strict_bool(control["immediate_capture"], "control.immediate_capture")
     for key in ("mouse_takeover_units", "mouse_takeover_pixels"):
         if key in control:
             value = _strict_int(control[key], f"control.{key}")
@@ -224,6 +227,8 @@ def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
         for key in ("mouse_takeover_units", "mouse_takeover_pixels")
         if getattr(ctrl, key) != getattr(default_ctrl, key)
     ]
+    if ctrl.immediate_capture != default_ctrl.immediate_capture:
+        control_lines.append(f"immediate_capture = {str(ctrl.immediate_capture).lower()}")
     if control_lines:
         lines += ["[control]", *control_lines, ""]
 

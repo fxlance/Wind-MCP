@@ -1,6 +1,6 @@
 [project]
 name = "windows-mcp"
-version = "0.8.8"
+version = "0.8.8+fxlance.1"
 description = "Lightweight MCP Server for interacting with Windows Operating System."
 authors = [
     { name = "Jeomon George", email = "jeogeoalukka@gmail.com" }
@@ -47,8 +47,8 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/CursorTouch"
-Repository = "https://github.com/CursorTouch/Windows-MCP"
-Issues = "https://github.com/CursorTouch/Windows-MCP/issues"
+Repository = "https://github.com/fxlance/Wind-MCP"
+Issues = "https://github.com/fxlance/Wind-MCP/issues"
 
 [project.scripts]
 windows-mcp = "windows_mcp.__main__:main"

@@ -211,6 +211,10 @@ class ControlToolGate(Middleware):
 
         def reject_user_state() -> None:
             status = self.controller.status()
+            if status.get("cancelled"):
+                raise self._blocked(ControlBlocked("USER_CANCELLED", status))
+            if status["state"] == "user" and getattr(self.controller, "can_capture", lambda: False)():
+                return
             if status["state"] not in ("ready", "ai"):
                 raise self._blocked(
                     ControlBlocked(
@@ -250,7 +254,29 @@ class ControlToolGate(Middleware):
                 # A synchronous indicator failure can invalidate the lease
                 # during begin_call's state notification.
                 self.controller.checkpoint(token)
-                return await call_next(context)
+                if name in {"Click", "Type", "Scroll", "Move", "Shortcut", "Wait", "WaitFor",
+                            "Screenshot", "Snapshot", "MultiSelect", "MultiEdit", "Clipboard", "DisplayInventory"}:
+                    worker = asyncio.create_task(call_next(context))
+                    try:
+                        while not worker.done():
+                            await asyncio.wait({worker}, timeout=0.05)
+                            status = self.controller.status()
+                            if status.get("cancelled"):
+                                worker.cancel()
+                                await asyncio.gather(worker, return_exceptions=True)
+                                status["executed_steps"] = get_step_count()
+                                raise ControlBlocked("USER_CANCELLED", status)
+                        result = await worker
+                    finally:
+                        if not worker.done():
+                            worker.cancel()
+                else:
+                    result = await call_next(context)
+                # Only report an Escape cancellation here; external commands
+                # already running are not retroactively undone by ownership changes.
+                if self.controller.status().get("cancelled"):
+                    raise ControlBlocked("USER_CANCELLED", self.controller.status())
+                return result
             except Exception as exc:
                 from windows_mcp.desktop.control import ControlBlocked
                 from windows_mcp.desktop.control_ledger import InputUnavailable
@@ -261,6 +287,9 @@ class ControlToolGate(Middleware):
                     status = self.controller.status()
                     status["executed_steps"] = get_step_count()
                     code = (
+                        "USER_CANCELLED"
+                        if status.get("cancelled")
+                        else
                         "CONTROL_UNAVAILABLE"
                         if status["state"] == "unavailable"
                         else "CONTROL_PREEMPTED"

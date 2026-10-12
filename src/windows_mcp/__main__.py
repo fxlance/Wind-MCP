@@ -73,6 +73,9 @@ _control_notifier: Any | None = None
 instructions = dedent("""
 Windows MCP server provides tools to interact directly with the Windows desktop,
 thus enabling to operate the desktop on the user's behalf.
+Physical Escape cancels control and returns USER_CANCELLED. Do not retry desktop
+actions after this cancellation until the user explicitly asks to continue;
+then call ControlStatus(resume=True). Immediate capture is enabled by default.
 """)
 
 
@@ -331,6 +334,7 @@ def _build_mcp() -> FastMCP:
         # Set thresholds before installing input hooks; invalid TOML was rejected at load.
         controller.mouse_takeover_units = _control_config.mouse_takeover_units
         controller.mouse_takeover_pixels = _control_config.mouse_takeover_pixels
+        controller.immediate_capture = _control_config.immediate_capture
 
         try:
             control_overlay.start()
@@ -656,6 +660,12 @@ def main():
     envvar="WINDOWS_MCP_STATELESS_HTTP",
     show_default=True,
 )
+@click.option(
+    "--immediate-capture/--no-immediate-capture",
+    default=None,
+    envvar="WINDOWS_MCP_IMMEDIATE_CAPTURE",
+    help="Capture desktop control immediately, without waiting for user idle (default: enabled).",
+)
 def serve(
     ctx,
     transport,
@@ -674,6 +684,7 @@ def serve(
     oauth_client_id,
     oauth_client_secret,
     stateless_http,
+    immediate_capture,
 ):
     global _control_config
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -693,6 +704,9 @@ def serve(
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc))
     _control_config = cfg.control
+    _control_config.immediate_capture = _choose_value(
+        ctx, "immediate_capture", immediate_capture, cfg.control.immediate_capture, True
+    )
 
     transport = _choose_value(ctx, "transport", transport, cfg.server.transport, "stdio")
     host = _choose_value(ctx, "host", host, cfg.server.host, "localhost")

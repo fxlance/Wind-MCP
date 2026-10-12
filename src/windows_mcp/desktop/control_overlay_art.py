@@ -8,14 +8,14 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from windows_mcp.desktop.overlay_bitmap import premultiplied_bgra
 
-_BORDER = 56
+_BORDER = 28
 _CURSOR_SIZE = 88
 _NOTICE_GLOW_PAD = 32
 _BREATH_PERIOD_SECONDS = 3.0
 _BREATH_MIN_ALPHA = 140
-_NOTICE_TITLE = "AI is controlling this computer"
-_NOTICE_SHORTCUT = "Ctrl + Alt + Shift + Backspace"
-_NOTICE_HINT = f"Press {_NOTICE_SHORTCUT} to take over"
+_NOTICE_TITLE = ""
+_NOTICE_SHORTCUT = "Escape"
+_NOTICE_HINT = "Escape для разблокировки"
 
 
 def _breath_opacity(elapsed: float) -> int:
@@ -100,71 +100,29 @@ def _notice_panel_mask(width: int, height: int) -> Image.Image:
 
 
 def _notice_bitmap(screen_width: int) -> tuple[int, int, bytes] | None:
-    """Render a centered two-line prompt below the upper glow."""
+    """Render only a compact, single-line Escape hint at the top edge."""
     available_width = screen_width - 32
-    if available_width < 200:
+    if available_width < 160:
         return None
-    horizontal_padding = 32 if screen_width >= 640 else 20
     font_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    # Prefer presentation-sized text, then shrink only when a monitor is narrow.
-    for hint_size in range(24, 7, -1):
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    for font_size in range(14, 7, -1):
         try:
-            title_font = ImageFont.truetype(str(font_dir / "seguisb.ttf"), hint_size + 8)
-            hint_font = ImageFont.truetype(str(font_dir / "segoeui.ttf"), hint_size)
+            font = ImageFont.truetype(str(font_dir / "segoeui.ttf"), font_size)
         except OSError:
-            title_font = hint_font = ImageFont.load_default()
-        measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-        title_box = measure.textbbox((0, 0), _NOTICE_TITLE, font=title_font)
-        hint_box = measure.textbbox((0, 0), _NOTICE_HINT, font=hint_font)
-        hint_prefix, _, hint_suffix = _NOTICE_HINT.partition(_NOTICE_SHORTCUT)
-        prefix_width = math.ceil(measure.textlength(hint_prefix, font=hint_font))
-        shortcut_width = math.ceil(measure.textlength(_NOTICE_SHORTCUT, font=hint_font))
-        suffix_width = math.ceil(measure.textlength(hint_suffix, font=hint_font))
-        title_width, title_height = title_box[2] - title_box[0], title_box[3] - title_box[1]
-        hint_width, hint_height = (
-            prefix_width + shortcut_width + suffix_width + 16,
-            hint_box[3] - hint_box[1],
-        )
-        width = max(title_width, hint_width) + 2 * horizontal_padding
+            font = ImageFont.load_default(size=font_size)
+        box = measure.textbbox((0, 0), _NOTICE_HINT, font=font)
+        text_width, text_height = box[2] - box[0], box[3] - box[1]
+        width = text_width + 32
         if width <= available_width:
             break
     else:
         return None
-
-    height = title_height + hint_height + 46
-    image = Image.new("RGBA", (width, height), (8, 42, 88, 0))
-    # Fade every edge from transparent to 80%; the rounded mask softens the corners too.
-    image.putalpha(_notice_panel_mask(width, height).point(lambda alpha: round(alpha * 0.8)))
+    height = text_height + 14
+    image = Image.new("RGBA", (width, height))
     draw = ImageDraw.Draw(image)
-    title_y = 18 - title_box[1]
-    hint_y = 28 + title_height - hint_box[1]
-    draw.text(
-        ((width - title_width) // 2 - title_box[0], title_y),
-        _NOTICE_TITLE,
-        font=title_font,
-        fill=(248, 251, 255, 255),
-    )
-    hint_x = (width - hint_width) // 2
-    badge_left = hint_x + prefix_width
-    # A solid black key label separates the takeover shortcut from its sentence.
-    draw.rounded_rectangle(
-        (
-            badge_left,
-            24 + title_height,
-            badge_left + shortcut_width + 15,
-            31 + title_height + hint_height,
-        ),
-        radius=6,
-        fill=(0, 0, 0, 255),
-    )
-    draw.text((hint_x, hint_y), hint_prefix, font=hint_font, fill=(225, 240, 255, 255))
-    draw.text((badge_left + 8, hint_y), _NOTICE_SHORTCUT, font=hint_font, fill=(255, 255, 255, 255))
-    draw.text(
-        (badge_left + shortcut_width + 16, hint_y),
-        hint_suffix,
-        font=hint_font,
-        fill=(225, 240, 255, 255),
-    )
+    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=7, fill=(8, 42, 88, 180))
+    draw.text((16 - box[0], 7 - box[1]), _NOTICE_HINT, font=font, fill=(248, 251, 255, 255))
     return width, height, premultiplied_bgra(image, 1.0)
 
 

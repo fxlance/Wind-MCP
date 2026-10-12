@@ -33,9 +33,14 @@ class ControlBlocked(RuntimeError):
 
 
 class ControlCoordinator:
-    def __init__(self, mouse_takeover_units: int = 120, mouse_takeover_pixels: int = 120):
+    def __init__(self, mouse_takeover_units: int = 120, mouse_takeover_pixels: int = 120,
+                 *, immediate_capture: bool = False):
         self.mouse_takeover_units = mouse_takeover_units
         self.mouse_takeover_pixels = mouse_takeover_pixels
+        # The public ControlConfig defaults to True; direct coordinators may
+        # still be used for the legacy cooperative-input mode.
+        self.immediate_capture = immediate_capture
+        self._escape_cancelled = False
         self._lock = threading.Lock()
         self._state = "unavailable"
         self._generation = 0
@@ -98,9 +103,9 @@ class ControlCoordinator:
             if self._state != "ai" or self._generation != generation or self._visual_paused:
                 return
             if (
-                self._last_physical_event != self._visual_event_stamp
+                (not self.immediate_capture and (self._last_physical_event != self._visual_event_stamp
                 or self._pressed
-                or self._mouse_down
+                or self._mouse_down))
                 or self._fast_takeover
                 or self._fast_pending
                 or self._emergency
@@ -110,17 +115,37 @@ class ControlCoordinator:
             self._visual_armed = True
             self._deadline = time.monotonic() + 1.0
             self._suppress = True
-            if self._last_physical_event != self._visual_event_stamp:
+            if not self.immediate_capture and self._last_physical_event != self._visual_event_stamp:
                 self._suppress = False
                 self._visual_armed = False
                 self.input_ledger.block_new()
+        if self.immediate_capture:
+            self._release_delivered_input()
+
+    def _release_delivered_input(self) -> None:
+        """Clear physical presses that reached an app before immediate takeover."""
+        from windows_mcp import uia
+        keys = tuple(self._delivered_keys)
+        # Modifier state can predate installation of the input monitor.
+        modifiers = (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
+        for key in {*keys, *(vk for vk in modifiers if uia.IsKeyPressed(vk))}:
+            if key == 0x1B:
+                continue
+            self._quarantine.add(key)
+            uia.ReleaseKey(key, waitTime=0)
+            self._delivered_keys.discard(key)
+        releases = {1: uia.ReleaseMouse, 2: uia.RightReleaseMouse, 3: uia.MiddleReleaseMouse}
+        for button in tuple(self._delivered_mouse):
+            if button in releases:
+                releases[button](waitTime=0)
+                self._delivered_mouse.discard(button)
 
     def pause_for_capture(self) -> int | None:
-        """Release physical input before an AI indicator is hidden for capture."""
+        """Keep immediate-mode input blocked during the brief capture suspension."""
         with self._lock:
             if self._state != "ai" or not self._visual_armed:
                 return None
-            self._suppress = False
+            self._suppress = self.immediate_capture
             self._visual_armed = False
             self._visual_paused = True
             self._visual_event_stamp = self._last_physical_event
@@ -152,7 +177,26 @@ class ControlCoordinator:
             if state == "user"
             else 0.0
         )
-        return {"state": state, "generation": self._generation, "wait_seconds": wait}
+        result = {"state": state, "generation": self._generation, "wait_seconds": wait}
+        if self.immediate_capture or self._escape_cancelled:
+            result.update(immediate_capture=self.immediate_capture, cancelled=self._escape_cancelled)
+        return result
+
+    def resume_control(self) -> dict:
+        """Clear an Escape latch only on an explicitly requested resume."""
+        with self._lock:
+            if self._active_calls:
+                raise ControlBlocked("CONTROL_BUSY", self._snapshot_locked(time.monotonic()))
+            self._escape_cancelled = False
+            self._fast_takeover = False
+            changed = self._set_locked("ready") if self._state == "user" else False
+            result = self._snapshot_locked(time.monotonic())
+        if changed:
+            self._notify(result)
+        return result
+
+    def can_capture(self) -> bool:
+        return self.immediate_capture and not self._escape_cancelled and not self._fast_takeover
 
     def status(self) -> dict:
         if self._emergency:
@@ -204,6 +248,8 @@ class ControlCoordinator:
         return True
 
     def _tick_locked(self, now: float) -> bool:
+        if self._escape_cancelled:
+            return False
         if self._state == "ready" and now - self._last_physical_event < 10.0:
             self._last_user = self._last_physical_event
             return self._set_locked("user")
@@ -235,7 +281,9 @@ class ControlCoordinator:
         now = time.monotonic()
         with self._lock:
             changed = self._set_locked("unavailable") if self._emergency else self._tick_locked(now)
-            if self._pressed or self._mouse_down:
+            if self._escape_cancelled:
+                raise ControlBlocked("USER_CANCELLED", self._snapshot_locked(now))
+            if not self.immediate_capture and (self._pressed or self._mouse_down):
                 raise ControlBlocked("PHYSICAL_INPUT_HELD", self._snapshot_locked(now))
             if (
                 self._emergency
@@ -243,7 +291,7 @@ class ControlCoordinator:
                 or self._fast_pending
                 or self._rotating
                 or self._visual_paused
-                or self._state not in ("ready", "ai")
+                or self._state not in ("ready", "ai", *(["user"] if self.immediate_capture else []))
             ):
                 status = self._snapshot_locked(now)
                 code = {"user": "USER_CONTROL", "takeover_pending": "TAKEOVER_PENDING"}.get(
@@ -281,7 +329,7 @@ class ControlCoordinator:
             ):
                 status = self._snapshot_locked(time.monotonic())
                 status["executed_steps"] = get_step_count()
-                raise ControlBlocked("CONTROL_PREEMPTED", status)
+                raise ControlBlocked("USER_CANCELLED" if self._escape_cancelled else "CONTROL_PREEMPTED", status)
 
     def checkpoint_current(self) -> None:
         """Validate each desktop input step inside a guarded MCP call."""
@@ -457,7 +505,16 @@ class ControlCoordinator:
             else:
                 changed = self._tick_locked(now)
                 kind = event[0]
-                if (
+                if kind == "escape":
+                    self._escape_cancelled = True
+                    self._last_user = now
+                    changed = self._set_locked("user") or changed
+                    self._fast_takeover = False
+                elif self.immediate_capture and self._state == "ai" and kind in ("key", "point", "raw"):
+                    # Physical input cannot steal an immediate lease, including
+                    # the short interval where capture hides the indicator.
+                    pass
+                elif (
                     kind in ("key", "point", "raw")
                     and self._state == "ai"
                     and not self._visual_armed
@@ -472,7 +529,7 @@ class ControlCoordinator:
                 elif kind in ("key", "point", "raw") and self._state in ("ready", "user"):
                     self._last_user = now
                     changed = self._set_locked("user") or changed
-                elif kind == "point" and self._state in ("ai", "takeover_pending"):
+                elif not self.immediate_capture and kind == "point" and self._state in ("ai", "takeover_pending"):
                     if event[3] == 0x200:  # WM_MOUSEMOVE
                         changed = self._candidate_locked(now) or changed
                         if self._point_origin is None:
@@ -481,7 +538,7 @@ class ControlCoordinator:
                         if math.hypot(event[1] - ox, event[2] - oy) >= self.mouse_takeover_pixels:
                             self._last_user = now
                             changed = self._set_locked("user") or changed
-                elif kind == "raw" and self._state in ("ai", "takeover_pending"):
+                elif not self.immediate_capture and kind == "raw" and self._state in ("ai", "takeover_pending"):
                     changed = self._candidate_locked(now) or changed
                     device, dx, dy = event[1:]
                     if self._raw_device is not None and device != self._raw_device:
@@ -558,7 +615,9 @@ class ControlCoordinator:
                 self._fail_open()
                 continue
             try:
-                if self._state == "ai" and self._visual_armed and not self._fast_takeover:
+                if (self._state == "ai"
+                        and (self._visual_armed or (self.immediate_capture and self._visual_paused))
+                        and not self._fast_takeover):
                     self._deadline = now + 1.0
                     self._suppress = True
                 else:
