@@ -7,10 +7,14 @@ or a failed event queue releases physical input in the hook itself.
 from __future__ import annotations
 
 import ctypes
+from collections import deque
+from itertools import count
 import math
+import os
 import queue
 import threading
 import time
+import uuid
 from typing import Callable
 from windows_mcp.desktop.control_context import current_token, current_steps, get_step_count
 from windows_mcp.desktop.control_ledger import InputLedger
@@ -84,6 +88,63 @@ class ControlCoordinator:
         self._key_callback = None
         self._window_callback = None
         self._rotate = False
+        # Hooks only append bounded, content-free records; they never do I/O
+        # or wait for a diagnostic lock. Export happens off the hook thread.
+        self._trace_events = deque(maxlen=256)
+        self._trace_sequence = count(1)
+        self._controller_id = uuid.uuid4().hex
+        self._first_fault = None
+        self._first_failure = None
+        self._rotation_id = 0
+        self._rotation_done = threading.Event()
+        self._rotation_done.set()
+        self._rotation_wait_seconds = 0.5
+
+    def _trace(self, event: str, reason: str) -> dict:
+        record = dict(seq=next(self._trace_sequence), monotonic_ns=time.monotonic_ns(),
+            thread_id=threading.get_ident(), event=event, reason=reason,
+            token=current_token.get(), generation=self._generation, state=self._state,
+            suppress=self._suppress, visual_armed=self._visual_armed,
+            visual_paused=self._visual_paused, rotating=self._rotating,
+            emergency=self._emergency, fast_takeover=self._fast_takeover,
+            fast_pending=self._fast_pending, cancelled=self._escape_cancelled,
+            rotation_id=self._rotation_id)
+        self._trace_events.append(record)
+        return record
+
+    def _diagnostic_locked(self) -> dict:
+        # Copy the deque before iterating: hook callbacks append without _lock.
+        events = [dict(value) for value in self._trace_events.copy()]
+        return dict(controller_id=self._controller_id, pid=os.getpid(), events=events,
+            dropped_events=max(0, (events[-1]['seq'] if events else 0)-len(events)),
+            first_fault=dict(self._first_fault) if self._first_fault else None,
+            first_failure=dict(self._first_failure) if self._first_failure else None,
+            rotation_wait_limit_seconds=self._rotation_wait_seconds)
+
+    def diagnostic(self) -> dict:
+        """Advisory trace snapshot; exporting must never contend with watchdog."""
+        return self._diagnostic_locked()
+
+    def failure_diagnostic(self, reason: str) -> dict:
+        """Preserve the alternate InputLedger -> middleware failure path."""
+        with self._lock:
+            record = self._trace('input_blocked', reason)
+            failure = dict(record, requested_token=current_token.get(), failed_predicates=[reason])
+            if self._first_failure is None:
+                self._first_failure = failure
+            return dict(self._diagnostic_locked(), requested_token=current_token.get(),
+                        failed_predicates=[reason])
+
+    def _begin_rotation(self, reason: str) -> None:
+        self._rotation_done.clear()
+        self._rotation_id += 1
+        self._rotating = True
+        self._trace('rotation_begin', reason)
+
+    def _end_rotation(self, succeeded: bool = True) -> None:
+        self._rotating = False
+        self._trace('rotation_end', 'hooks_replaced' if succeeded else 'hook_replacement_failed')
+        self._rotation_done.set()
 
     def subscribe(self, callback: Callable[[dict], None]) -> None:
         with self._lock:
@@ -115,6 +176,7 @@ class ControlCoordinator:
             self._visual_armed = True
             self._deadline = time.monotonic() + 1.0
             self._suppress = True
+            self._trace('visual_armed', 'indicator_acknowledged')
             if not self.immediate_capture and self._last_physical_event != self._visual_event_stamp:
                 self._suppress = False
                 self._visual_armed = False
@@ -150,6 +212,7 @@ class ControlCoordinator:
             self._visual_paused = True
             self._visual_event_stamp = self._last_physical_event
             self.input_ledger.block_new()
+            self._trace('capture_pause', 'indicator_hidden')
             return self._generation
 
     def resume_after_capture(self, generation: int | None, *, restored: bool) -> None:
@@ -157,7 +220,7 @@ class ControlCoordinator:
         if generation is None:
             return
         if not restored or (self._health_probe is not None and not self._health_probe()):
-            self._fail_open()
+            self._fail_open('capture_indicator_restore_failed')
             return
         with self._lock:
             if generation == self._generation:
@@ -189,7 +252,7 @@ class ControlCoordinator:
                 raise ControlBlocked("CONTROL_BUSY", self._snapshot_locked(time.monotonic()))
             self._escape_cancelled = False
             self._fast_takeover = False
-            changed = self._set_locked("ready") if self._state == "user" else False
+            changed = self._set_locked("ready", 'explicit_resume') if self._state == "user" else False
             result = self._snapshot_locked(time.monotonic())
         if changed:
             self._notify(result)
@@ -219,7 +282,7 @@ class ControlCoordinator:
                 try:
                     self.input_ledger.release_all()
                 except Exception:
-                    self._fail_open()
+                    self._fail_open('held_input_release_failed')
                     self._set_locked("unavailable")
                     result = self._snapshot_locked(time.monotonic())
         for listener in tuple(self._listeners):
@@ -228,7 +291,7 @@ class ControlCoordinator:
             except Exception:
                 pass  # A disconnected MCP session must not hold desktop control.
 
-    def _set_locked(self, state: str) -> bool:
+    def _set_locked(self, state: str, reason: str = 'state_change') -> bool:
         if state == self._state:
             return False
         self._state = state
@@ -245,6 +308,7 @@ class ControlCoordinator:
             self._fast_pending = False
         self._suppress = self._visual_armed and not self._emergency
         self._deadline = time.monotonic() + 1.0 if self._suppress else 0.0
+        self._trace('state_transition', reason)
         return True
 
     def _tick_locked(self, now: float) -> bool:
@@ -252,27 +316,27 @@ class ControlCoordinator:
             return False
         if self._state == "ready" and now - self._last_physical_event < 10.0:
             self._last_user = self._last_physical_event
-            return self._set_locked("user")
+            return self._set_locked("user", 'recent_physical_input')
         if (
             self._state == "user"
             and not self._pressed
             and not self._mouse_down
             and now - max(self._last_user, self._last_physical_event) >= 10.0
         ):
-            return self._set_locked("ready")
+            return self._set_locked("ready", 'physical_idle_elapsed')
         if (
             self._state == "takeover_pending"
             and not self._mouse_down
             and now - self._last_move >= 0.3
         ):
             return self._set_locked(
-                "ai" if self._active_calls or now < self._lease_until else "ready"
+                "ai" if self._active_calls or now < self._lease_until else "ready", 'movement_candidate_idle'
             )
         if self._state == "ai" and not self._active_calls and now >= self._lease_until:
             if now - self._last_physical_event < 10.0:
                 self._last_user = self._last_physical_event
-                return self._set_locked("user")
-            return self._set_locked("ready")
+                return self._set_locked("user", 'lease_expired_with_physical_input')
+            return self._set_locked("ready", 'lease_expired')
         return False
 
     def begin_call(self, name: str) -> int:
@@ -301,12 +365,15 @@ class ControlCoordinator:
             try:
                 self.input_ledger.enable()  # Any failed release keeps the lease closed.
             except RuntimeError:
-                self._fail_open()
+                self._fail_open('lease_input_ledger_failed')
                 self._set_locked("unavailable")
                 raise ControlBlocked("CONTROL_UNAVAILABLE", self._snapshot_locked(now)) from None
-            changed = self._set_locked("ai") or changed
+            changed = self._set_locked("ai", 'tool_begin') or changed
             self._active_calls += 1
             token = self._generation
+            if self._active_calls == 1:
+                self._first_failure = None
+            self._trace('lease_begin', name)
             result = self._snapshot_locked(now)
         if changed:
             self._begin_notification.active = True
@@ -317,19 +384,40 @@ class ControlCoordinator:
         return token
 
     def checkpoint(self, token: int) -> None:
-        with self._lock:
-            if (
-                self._state != "ai"
-                or self._generation != token
-                or self._fast_takeover
-                or self._fast_pending
-                or self._rotating
-                or self._emergency
-                or not self._suppress
-            ):
-                status = self._snapshot_locked(time.monotonic())
-                status["executed_steps"] = get_step_count()
-                raise ControlBlocked("USER_CANCELLED" if self._escape_cancelled else "CONTROL_PREEMPTED", status)
+        # Periodic hook replacement is a pause, not a revoked lease. Keep the
+        # same token, wait outside _lock, and recheck every original predicate.
+        # No input runs while rotating, no blocked exception is swallowed, and
+        # a fault/Escape/token change stops immediately. Never wait on the pump.
+        until = time.monotonic() + self._rotation_wait_seconds
+        while True:
+            with self._lock:
+                failed = [name for name, invalid in (
+                    ('state_not_ai', self._state != 'ai'),
+                    ('generation_mismatch', self._generation != token),
+                    ('fast_takeover', self._fast_takeover),
+                    ('fast_pending', self._fast_pending),
+                    ('rotating', self._rotating),
+                    ('emergency', self._emergency),
+                    ('suppression_off', not self._suppress)) if invalid]
+                if not failed:
+                    return
+                remaining = until-time.monotonic()
+                if (failed != ['rotating'] or self._escape_cancelled or remaining <= 0
+                        or threading.current_thread() is self._thread):
+                    reason = ('rotation_wait_timeout' if failed == ['rotating'] and remaining <= 0
+                              else 'rotation_on_monitor_thread' if failed == ['rotating']
+                              and threading.current_thread() is self._thread else 'predicate_failed')
+                    record = self._trace('checkpoint_blocked', reason)
+                    failure = dict(record, requested_token=token, failed_predicates=failed)
+                    if self._first_failure is None:
+                        self._first_failure = failure
+                    status = self._snapshot_locked(time.monotonic())
+                    status['executed_steps'] = get_step_count()
+                    status['native_diagnostic'] = dict(self._diagnostic_locked(),
+                        requested_token=token, failed_predicates=failed)
+                    raise ControlBlocked('USER_CANCELLED' if self._escape_cancelled
+                                         else 'CONTROL_PREEMPTED', status)
+            self._rotation_done.wait(min(0.05, remaining))
 
     def checkpoint_current(self) -> None:
         """Validate each desktop input step inside a guarded MCP call."""
@@ -363,6 +451,7 @@ class ControlCoordinator:
             self._active_calls = max(0, self._active_calls - 1)
             if self._state in ("ai", "takeover_pending") and not self._active_calls:
                 self._lease_until = time.monotonic() + 15.0
+            self._trace('lease_end', 'tool_returned')
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -381,6 +470,8 @@ class ControlCoordinator:
         self._fast_takeover = False
         self._fast_pending = False
         self._rotating = False
+        self._rotation_done.set()
+        self._first_fault = self._first_failure = None
         self._thread = threading.Thread(target=self._run, name="windows-mcp-input", daemon=True)
         self._thread.start()
         if not self._ready.wait(3.0) or self._startup_error:
@@ -430,12 +521,16 @@ class ControlCoordinator:
         self._quarantine.clear()
         self._thread = self._watchdog = None
 
-    def _fail_open(self) -> None:
+    def _fail_open(self, reason: str = 'unspecified_native_fault') -> None:
         self._suppress = False
         self._deadline = 0.0
         self.input_ledger.block_new()  # Atomic flag; hooks must never wait for AI injection.
         self._emergency = True
         self._rotate = True
+        record = self._trace('fail_open', reason)
+        if self._first_fault is None:
+            self._first_fault = record
+        self._rotation_done.set()  # Wake a paused checkpoint to observe the fault.
         # Hook callbacks must not wait on SendInput or the ledger lock. Wake
         # the existing watchdog to clear AI holds immediately off-hook.
         self._release_requested.set()
@@ -486,7 +581,7 @@ class ControlCoordinator:
         try:
             self._events.put_nowait(event)
         except queue.Full:
-            self._fail_open()
+            self._fail_open('physical_event_queue_full')
 
     def _physical_mouse(self, code, wparam, lparam):
         return control_hooks.physical_mouse(self, code, wparam, lparam)
@@ -508,7 +603,7 @@ class ControlCoordinator:
                 if kind == "escape":
                     self._escape_cancelled = True
                     self._last_user = now
-                    changed = self._set_locked("user") or changed
+                    changed = self._set_locked("user", 'physical_escape') or changed
                     self._fast_takeover = False
                 elif self.immediate_capture and self._state == "ai" and kind in ("key", "point", "raw"):
                     # Physical input cannot steal an immediate lease, including
@@ -521,14 +616,14 @@ class ControlCoordinator:
                 ):
                     # Physical input was delivered while the indicator was not armed.
                     self._last_user = now
-                    changed = self._set_locked("user") or changed
+                    changed = self._set_locked("user", 'physical_input_before_indicator') or changed
                 if kind == "hotkey" and self._state in ("ai", "takeover_pending"):
                     self._last_user = now
-                    changed = self._set_locked("user") or changed
+                    changed = self._set_locked("user", 'physical_takeover_chord') or changed
                     self._fast_takeover = False
                 elif kind in ("key", "point", "raw") and self._state in ("ready", "user"):
                     self._last_user = now
-                    changed = self._set_locked("user") or changed
+                    changed = self._set_locked("user", 'physical_input_while_free') or changed
                 elif not self.immediate_capture and kind == "point" and self._state in ("ai", "takeover_pending"):
                     if event[3] == 0x200:  # WM_MOUSEMOVE
                         changed = self._candidate_locked(now) or changed
@@ -537,7 +632,7 @@ class ControlCoordinator:
                         ox, oy = self._point_origin
                         if math.hypot(event[1] - ox, event[2] - oy) >= self.mouse_takeover_pixels:
                             self._last_user = now
-                            changed = self._set_locked("user") or changed
+                            changed = self._set_locked("user", 'mouse_pixel_threshold') or changed
                 elif not self.immediate_capture and kind == "raw" and self._state in ("ai", "takeover_pending"):
                     changed = self._candidate_locked(now) or changed
                     device, dx, dy = event[1:]
@@ -549,14 +644,14 @@ class ControlCoordinator:
                     self._raw_origin[device] = (x, y)
                     if math.hypot(x, y) >= self.mouse_takeover_units:
                         self._last_user = now
-                        changed = self._set_locked("user") or changed
+                        changed = self._set_locked("user", 'mouse_raw_threshold') or changed
             result = self._snapshot_locked(now)
         if changed:
             self._notify(result)
 
     def _candidate_locked(self, now: float) -> bool:
         if self._state == "ai":
-            changed = self._set_locked("takeover_pending")
+            changed = self._set_locked("takeover_pending", 'physical_movement_candidate')
         else:
             changed = False
         self._last_move = now
@@ -566,11 +661,14 @@ class ControlCoordinator:
         mouse = _user32.SetWindowsHookExW(14, self._mouse_callback, instance, 0)
         key = _user32.SetWindowsHookExW(13, self._key_callback, instance, 0)
         if not mouse or not key:
+            error_code = ctypes.get_last_error()
+            hook = 'both_hooks' if not mouse and not key else 'mouse_hook' if not mouse else 'keyboard_hook'
+            self._trace('hook_install_failed', f'{hook};win32={error_code}')
             if mouse:
                 _user32.UnhookWindowsHookEx(mouse)
             if key:
                 _user32.UnhookWindowsHookEx(key)
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(error_code)
         old_mouse, old_key = self._mouse_hook, self._key_hook
         self._mouse_hook, self._key_hook = mouse, key
         for old in (old_mouse, old_key):
@@ -595,10 +693,16 @@ class ControlCoordinator:
             now = time.monotonic()
             try:
                 indicator_ok = self._health_probe is None or self._health_probe()
-                desktop_ok = _interactive_desktop()
+                indicator_reason = 'indicator_unhealthy'
             except Exception:
                 indicator_ok = False
+                indicator_reason = 'indicator_probe_exception'
+            try:
+                desktop_ok = _interactive_desktop()
+                desktop_reason = 'interactive_desktop_unavailable'
+            except Exception:
                 desktop_ok = False
+                desktop_reason = 'desktop_probe_exception'
             # The watchdog cannot renew suppression without a live coordinator
             # proof: a wedged lock, stopped message loop or emergency fails open.
             if (
@@ -608,11 +712,20 @@ class ControlCoordinator:
                 or not indicator_ok
                 or not desktop_ok
             ):
-                self._fail_open()
+                faults = ([('input_thread_missing' if not self._thread else 'input_thread_stopped')]
+                          if not self._thread or not self._thread.is_alive() else [])
+                if now-self._thread_beat > 1.0:
+                    faults.append('input_thread_heartbeat_expired')
+                if not indicator_ok:
+                    faults.append(indicator_reason)
+                if not desktop_ok:
+                    faults.append(desktop_reason)
+                self._trace('watchdog_fault', '|'.join(faults))
+                self._fail_open(faults[0])
                 self._mark_unavailable()
                 continue
             if not self._lock.acquire(blocking=False):
-                self._fail_open()
+                self._fail_open('coordinator_lock_busy')
                 continue
             try:
                 if (self._state == "ai"

@@ -286,6 +286,7 @@ class ControlToolGate(Middleware):
                 if isinstance(exc, InputUnavailable):
                     status = self.controller.status()
                     status["executed_steps"] = get_step_count()
+                    status['native_diagnostic'] = self.controller.failure_diagnostic('input_ledger_blocked')
                     code = (
                         "USER_CANCELLED"
                         if status.get("cancelled")

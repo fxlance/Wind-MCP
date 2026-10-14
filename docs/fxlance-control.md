@@ -2,8 +2,11 @@
 
 Форк [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP),
 репозиторий [fxlance/Wind-MCP](https://github.com/fxlance/Wind-MCP).
-Пакет и команда сохраняют имя `windows-mcp`; версия форка — `0.8.8+fxlance.1`.
+Пакет и команда сохраняют имя `windows-mcp`; версия исходников — `0.8.8+fxlance.2`.
 Python 3.14 или новее. Установка Codex-ops закрепляется на коммите этого репозитория.
+Установленные закреплённые окружения `.1` автоматически не обновляются.
+Исправление ротации и приватный журнал описаны в
+[control-rotation-diagnostics.md](control-rotation-diagnostics.md).
 
 ## Поведение
 

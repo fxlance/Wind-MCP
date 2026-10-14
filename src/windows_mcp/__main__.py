@@ -289,7 +289,7 @@ def _build_mcp() -> FastMCP:
                 control_overlay.set_active(False, generation=generation)
         except Exception:
             # A missing visual indicator invalidates the AI control lease.
-            controller._fail_open()
+            controller._fail_open('indicator_update_failed')
             logger.exception("AI control indicator failed; releasing physical input")
 
     def show_control_state(status: dict) -> None:
@@ -309,7 +309,7 @@ def _build_mcp() -> FastMCP:
                     )
                 )
             except RuntimeError:
-                controller._fail_open()
+                controller._fail_open('indicator_schedule_failed')
                 logger.exception("Could not schedule AI control indicator update")
         else:
             # begin_call waits for the visible AI indicator before any tool runs.

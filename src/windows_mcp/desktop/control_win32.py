@@ -263,7 +263,7 @@ def run_input_monitor(owner: Any) -> None:
             try:
                 owner._raw_input(lparam)
             except Exception:
-                owner._fail_open()
+                owner._fail_open('raw_input_handler_failed')
         return _user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     owner._window_callback = window_proc
@@ -302,14 +302,20 @@ def run_input_monitor(owner: Any) -> None:
                 owner._handle(event)
             owner._handle(("tick",))
             if owner._rotate or time.monotonic() - last_rotate >= 5.0:
-                owner._rotating = True  # Pause AI without letting physical down leak.
+                owner._begin_rotation('fault_recovery' if owner._rotate else 'interval_elapsed')
+                succeeded = False
                 try:
                     owner._install_hooks(instance)
                     owner._rotate = False
                     last_rotate = time.monotonic()
                     owner._recover_after_rehook()
+                    succeeded = True
+                except Exception:
+                    # Publish the fault before waking a paused checkpoint.
+                    owner._fail_open('hook_rotation_failed')
+                    raise
                 finally:
-                    owner._rotating = False
+                    owner._end_rotation(succeeded)
             # Block until there is something to pump instead of sleeping past it.
             # A low-level hook is delivered on this thread, so an unconditional
             # sleep here is a fixed tax on the latency of every injected and
@@ -319,7 +325,7 @@ def run_input_monitor(owner: Any) -> None:
             )
     except Exception as exc:
         owner._startup_error = exc
-        owner._fail_open()
+        owner._fail_open('input_monitor_failed')
         owner._ready.set()
     finally:
         owner._suppress = False

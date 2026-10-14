@@ -28,8 +28,11 @@ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
         valid = True
         owner._last_physical_event = time.monotonic()
         if wparam == 0x200 and owner._suppress and not owner.immediate_capture:
+            first_pending = not owner._fast_pending
             owner._fast_pending = True  # Pause AI before queued movement is processed.
             owner.input_ledger.block_new()
+            if first_pending:
+                owner._trace('takeover_pending', 'physical_mouse_move')
         button = _mouse_button(wparam, data.mouseData)
         if button:
             if button[1]:
@@ -44,9 +47,9 @@ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
                     owner._delivered_mouse.discard(button[0])
                     return _user32.CallNextHookEx(owner._mouse_hook, code, wparam, lparam)
                 return 1
-            owner._fail_open()
+            owner._fail_open('mouse_suppression_deadline_expired')
     except Exception:
-        owner._fail_open()
+        owner._fail_open('mouse_hook_failed')
     if valid and button:
         if button[1]:
             owner._delivered_mouse.add(button[0])
@@ -84,6 +87,8 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
             owner._fast_takeover = True
             owner._suppress = False
             owner.input_ledger.block_new()
+            owner._trace('cancel', 'physical_escape')
+            owner._rotation_done.set()
             owner._queue(("escape",))
             return 1
         if (
@@ -99,6 +104,7 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
             owner._fast_takeover = True
             owner._suppress = False  # Release first, then tell the coordinator.
             owner.input_ledger.block_new()
+            owner._trace('takeover', 'physical_takeover_chord')
             owner._queue(("hotkey",))
             return 1
         owner._queue(("key",))
@@ -108,9 +114,9 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
                     owner._delivered_keys.discard(vk)
                     return _user32.CallNextHookEx(owner._key_hook, code, wparam, lparam)
                 return 1
-            owner._fail_open()
+            owner._fail_open('key_suppression_deadline_expired')
     except Exception:
-        owner._fail_open()
+        owner._fail_open('key_hook_failed')
     if vk is not None and down:
         owner._delivered_keys.add(vk)
     elif vk is not None:
@@ -125,6 +131,9 @@ def raw_input(owner: Any, lparam: int) -> None:
         return  # Null devices can be touchpads; do not infer source.
     owner._last_physical_event = time.monotonic()
     if owner._suppress and not owner.immediate_capture:
+        first_pending = not owner._fast_pending
         owner._fast_pending = True
         owner.input_ledger.block_new()
+        if first_pending:
+            owner._trace('takeover_pending', 'physical_raw_mouse')
     owner._queue(("raw", *raw))
