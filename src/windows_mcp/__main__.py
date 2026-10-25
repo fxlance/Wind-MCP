@@ -336,6 +336,13 @@ def _build_mcp() -> FastMCP:
         controller.mouse_takeover_pixels = _control_config.mouse_takeover_pixels
         controller.immediate_capture = _control_config.immediate_capture
 
+        from windows_mcp.desktop.control_focus import FocusReturn
+        controller.set_focus_return(FocusReturn(
+            is_current=controller.focus_return_is_current,
+            capture_current=controller.focus_capture_is_current,
+            before_restore=lambda generation: control_overlay.set_active(False, generation=generation),
+        ))
+
         try:
             control_overlay.start()
             controller.set_health_probe(control_overlay.is_healthy)

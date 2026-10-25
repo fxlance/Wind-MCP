@@ -54,6 +54,7 @@ class ControlCoordinator:
         self._session_timeout = 300
         self._session_until = 0.0
         self._session_end_reason: str | None = None
+        self._focus_return = None
         self._last_user = 0.0
         self._last_physical_event = 0.0  # Written before hook events enter the queue.
         self._last_move = 0.0
@@ -253,12 +254,26 @@ class ControlCoordinator:
             "remaining_seconds": max(0.0, self._session_until - now),
             "end_reason": self._session_end_reason,
         }
+        if self._focus_return is not None:
+            result['focus_return'] = self._focus_return.status()
         return result
 
     def check_session_owner(self, owner: str | None) -> None:
         """Bind a sustained capture to the server's MCP session, not tool arguments."""
         with self._lock:
             self._check_session_owner_locked(owner)
+
+    def set_focus_return(self, manager) -> None:
+        """Installed by the native lifespan; pure control fixtures need no GUI."""
+        self._focus_return = manager
+
+    def focus_return_is_current(self, generation: int) -> bool:
+        with self._lock:
+            return self._generation == generation and self._state not in ('ai', 'takeover_pending')
+
+    def focus_capture_is_current(self, token: int) -> bool:
+        with self._lock:
+            return self._generation == token and self._state == 'ai' and not self._escape_cancelled
 
     def _check_session_owner_locked(self, owner: str | None) -> None:
         if self._session_owner is not None and owner != self._session_owner:
@@ -320,6 +335,9 @@ class ControlCoordinator:
             result = self._snapshot_locked(time.monotonic())
         if changed:
             self._notify(result)
+        if self._focus_return is not None:
+            self._focus_return.flush()
+            result['focus_return'] = self._focus_return.status()
         return result
 
     def resume_control(self) -> dict:
@@ -367,6 +385,8 @@ class ControlCoordinator:
                 listener(result)
             except Exception:
                 pass  # A disconnected MCP session must not hold desktop control.
+        if result['state'] not in ('ai', 'takeover_pending') and self._focus_return is not None:
+            self._focus_return.request(result['generation'])
 
     def _set_locked(self, state: str, reason: str = 'state_change') -> bool:
         if state == self._state:
@@ -427,6 +447,8 @@ class ControlCoordinator:
         return False
 
     def begin_call(self, name: str) -> int:
+        if self._focus_return is not None:
+            self._focus_return.before_input()
         self.check_session_owner(current_owner.get())
         if self._emergency:
             self._mark_unavailable()
@@ -462,10 +484,15 @@ class ControlCoordinator:
             if self._session_owner is not None:
                 self._session_until = now + self._session_timeout
             token = self._generation
+            remember_focus = name == 'ControlBegin' and self._session_owner is None
             if self._active_calls == 1:
                 self._first_failure = None
             self._trace('lease_begin', name)
             result = self._snapshot_locked(now)
+        if remember_focus and self._focus_return is not None:
+            # The indicator is shown by _notify below, after the original HWND
+            # and placement have been read. Repeated Begin preserves the origin.
+            self._focus_return.remember(token)
         if changed:
             self._begin_notification.active = True
             try:
@@ -603,6 +630,9 @@ class ControlCoordinator:
         finally:
             if changed:
                 self._notify(result)
+            if self._focus_return is not None:
+                self._focus_return.close()
+                self._focus_return = None
         if (self._thread and self._thread.is_alive()) or (
             self._watchdog and self._watchdog.is_alive()
         ):

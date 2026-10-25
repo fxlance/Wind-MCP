@@ -1,6 +1,6 @@
 [project]
 name = "windows-mcp"
-version = "0.8.8+fxlance.3"
+version = "0.8.8+fxlance.4"
 description = "Lightweight MCP Server for interacting with Windows Operating System."
 authors = [
     { name = "Jeomon George", email = "jeogeoalukka@gmail.com" }

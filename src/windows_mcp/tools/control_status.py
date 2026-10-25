@@ -24,7 +24,7 @@ def register(mcp, *, get_desktop, get_analytics):
 
     @mcp.tool(
         name="ControlBegin",
-        description="Begin an exclusive desktop control session. Keeps the blue frame and input capture between tools, including screenshots. Physical Escape cancels the entire session for all clients. Owner UI calls renew the abandonment timeout (30-900 seconds, default 300); use ControlKeepAlive during longer analysis and ControlEnd when finished. Never resume USER_CANCELLED without a new human instruction.",
+        description="Begin an exclusive desktop control session and remember the original foreground window and placement. Keeps the blue frame and input capture between tools, including screenshots. End, physical Escape, timeout or native shutdown releases input and attempts to return to that window. Physical Escape cancels the entire session for all clients. Owner UI calls renew the abandonment timeout (30-900 seconds, default 300); use ControlKeepAlive during longer analysis and ControlEnd when finished. Never resume USER_CANCELLED without a new human instruction.",
         annotations=ToolAnnotations(title="ControlBegin", readOnlyHint=False,
             destructiveHint=False, idempotentHint=True, openWorldHint=False),
     )
@@ -42,7 +42,7 @@ def register(mcp, *, get_desktop, get_analytics):
 
     @mcp.tool(
         name="ControlEnd",
-        description="End your desktop control session and release the blue frame and physical input. Safe after Escape; does not clear cancellation or end another client's session. Always call when finished or before handing work to another chat.",
+        description="End your desktop control session, release the blue frame and physical input, and return to the original foreground window and placement when it still exists and Windows permits activation. Safe after Escape; does not clear cancellation or end another client's session. Always call when finished or before handing work to another chat.",
         annotations=ToolAnnotations(title="ControlEnd", readOnlyHint=False,
             destructiveHint=False, idempotentHint=True, openWorldHint=False),
     )

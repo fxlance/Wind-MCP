@@ -122,6 +122,54 @@ def test_native_failure_drops_capture_session(coordinator):
     assert not coordinator.session_active()
 
 
+@pytest.mark.parametrize('ending', ['end', 'escape', 'timeout', 'fault', 'stop'])
+def test_session_returns_original_window_on_every_release_path(coordinator, ending):
+    from windows_mcp.desktop.control_focus import FocusReturn
+    events = []
+    def capture():
+        events.append('capture')
+        return 'original-window'
+    def restore(origin):
+        assert not coordinator._suppress
+        assert not coordinator.input_ledger.pending()
+        events.append(('restore', origin))
+        return 'restored'
+    manager = FocusReturn(capture=capture, restore=restore,
+        is_current=coordinator.focus_return_is_current,
+        capture_current=coordinator.focus_capture_is_current)
+    coordinator.set_focus_return(manager)
+    coordinator.subscribe(lambda status: events.append('frame') if status['state'] == 'ai' else None)
+    try:
+        begin(coordinator)
+        assert events[:2] == ['capture', 'frame']
+        begin(coordinator)  # Same owner must not replace the original window.
+        assert events.count('capture') == 1
+        coordinator.input_ledger.press('key:ctrl', lambda: None, lambda: events.append('key-up'), lambda: False)
+        if ending == 'end':
+            coordinator.end_session('one')
+        elif ending == 'escape':
+            escape(coordinator)
+        elif ending == 'timeout':
+            coordinator._session_until = time.monotonic() - 1
+            coordinator.status()
+        elif ending == 'fault':
+            coordinator._fail_open('fixture_failure')
+            coordinator.status()
+        else:
+            coordinator.stop()
+        manager.flush()
+        assert events.count(('restore', 'original-window')) == 1
+        assert events.index('key-up') < events.index(('restore', 'original-window'))
+        assert manager.status()['state'] == 'restored'
+        if ending in ('escape','timeout'):
+            assert coordinator.status()['cancelled']
+        coordinator.end_session('one')
+        assert events.count(('restore', 'original-window')) == 1
+    finally:
+        manager.close()
+        coordinator.set_focus_return(None)
+
+
 def test_session_screenshot_never_hides_indicator(monkeypatch, coordinator):
     from windows_mcp.desktop import service, control_overlay
     begin(coordinator)

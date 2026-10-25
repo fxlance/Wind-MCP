@@ -408,6 +408,16 @@ async def test_overlay_callback_never_waits_on_hook_thread(monkeypatch):
 
         def stop(self):
             self.state = "unavailable"
+            self.focus_return.close()
+
+        def set_focus_return(self, manager):
+            self.focus_return = manager
+
+        def focus_return_is_current(self, generation):
+            return False
+
+        def focus_capture_is_current(self, generation):
+            return False
 
         def _fail_open(self, reason=None):
             self.fail_count += 1
