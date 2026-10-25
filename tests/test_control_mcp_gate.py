@@ -57,6 +57,9 @@ class FakeController:
         if self.state != "ai":
             raise ControlBlocked("CONTROL_PREEMPTED", self.status())
 
+    def failure_diagnostic(self, reason):
+        return {"failed_predicates": [reason]}
+
 
 @pytest.mark.asyncio
 async def test_gate_blocks_dynamic_tools_but_status_remains_available():
@@ -406,7 +409,7 @@ async def test_overlay_callback_never_waits_on_hook_thread(monkeypatch):
         def stop(self):
             self.state = "unavailable"
 
-        def _fail_open(self):
+        def _fail_open(self, reason=None):
             self.fail_count += 1
 
         def set_health_probe(self, probe):

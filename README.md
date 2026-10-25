@@ -2,10 +2,14 @@
 
 Форк Windows-MCP для fxlance: немедленный захват ввода по умолчанию,
 физический Escape для отмены, рамка вдвое тоньше и компактная подсказка.
-Пакет/команда: `windows-mcp`, версия: `0.8.8+fxlance.1`, Python 3.14+.
+Пакет/команда: `windows-mcp`, версия: `0.8.8+fxlance.3`, Python 3.14+.
+
+Непрерывный захват: `ControlBegin` → UI-вызовы / `ControlKeepAlive` → `ControlEnd`.
+Синяя рамка остаётся видимой между вызовами и во время скриншотов. Физический Escape
+освобождает ввод и отменяет всю сессию; новый захват требует команды пользователя.
 
 [Поведение и настройка](docs/fxlance-control.md). Для Codex используйте
-[установщик codex-ops](https://github.com/fxlance/codex-ops/blob/codex/bootstrap/docs/windows-mcp.md),
+[инструкцию ops](https://github.com/fxlance/ops/blob/main/wind-mcp/README.md),
 который закрепляет проверенный коммит **fxlance/Wind-MCP**. Оригинальный пакет
 из PyPI не содержит наших изменений. Лицензия и авторство upstream сохранены.
 

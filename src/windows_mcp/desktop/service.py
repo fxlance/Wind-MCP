@@ -1352,10 +1352,20 @@ class Desktop:
         )
 
     def get_screenshot(self, capture_rect: uia.Rect | None = None) -> Image.Image:
+        controller = get_controller()
+        if getattr(controller, "session_active", lambda: False)():
+            # Keep the human-visible ownership indicator continuous. Windows
+            # excludes the overlay HWNDs from capture where supported; on other
+            # backends a visible border in the image is preferable to hiding it.
+            with control_overlay.persistent_capture():
+                if not flash_overlay.cancel_active_flash():
+                    raise RuntimeError("Previous screenshot flash did not close before capture")
+                image, used_backend = screenshot_capture.capture(capture_rect)
+                self._last_screenshot_backend = used_backend
+            return image
         # The persistent AI indicator is hidden and acknowledged before any
         # screenshot backend reads pixels. Physical input is released first so
         # a stalled capture cannot leave the user blocked by an invisible AI.
-        controller = get_controller()
         capture_generation = controller.pause_for_capture()
         restored = False
         try:

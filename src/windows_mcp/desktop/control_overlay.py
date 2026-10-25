@@ -455,6 +455,13 @@ def is_healthy() -> bool:
 
 
 @contextmanager
+def persistent_capture():
+    """Serialize a capture without hiding the control-session indicator."""
+    with _capture_lock:
+        yield
+
+
+@contextmanager
 def suspend_for_capture():
     """Serialize captures and wait for the indicator to disappear first."""
     with _capture_lock:

@@ -30,7 +30,7 @@ class ControlTraceWriter:
     def __enter__(self):
         source = Path(__file__).parent
         snapshot = self.controller.diagnostic()
-        header = dict(schema=1, event='trace_header', sdk_version='0.8.8+fxlance.2',
+        header = dict(schema=1, event='trace_header', sdk_version='0.8.8+fxlance.3',
             **self.ids, controller_id=snapshot['controller_id'], pid=snapshot['pid'],
             utc=datetime.now(timezone.utc).isoformat(), monotonic_ns=time.monotonic_ns(),
             source_hashes={name:hashlib.sha256((source/name).read_bytes()).hexdigest()

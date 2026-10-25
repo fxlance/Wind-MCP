@@ -1791,7 +1791,7 @@ wheels = [
 
 [[package]]
 name = "windows-mcp"
-version = "0.8.8+fxlance.2"
+version = "0.8.8+fxlance.3"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

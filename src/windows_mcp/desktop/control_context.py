@@ -16,6 +16,9 @@ class StepCounter:
 current_token: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "windows_mcp_control_token", default=None
 )
+current_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "windows_mcp_control_owner", default=None
+)
 current_steps: contextvars.ContextVar[StepCounter | None] = contextvars.ContextVar(
     "windows_mcp_control_steps", default=None
 )

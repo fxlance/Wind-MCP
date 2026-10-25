@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from typing import Callable
-from windows_mcp.desktop.control_context import current_token, current_steps, get_step_count
+from windows_mcp.desktop.control_context import current_token, current_steps, current_owner, get_step_count
 from windows_mcp.desktop.control_ledger import InputLedger
 from windows_mcp.desktop import control_hooks
 from windows_mcp.desktop.control_win32 import (
@@ -50,6 +50,10 @@ class ControlCoordinator:
         self._generation = 0
         self._active_calls = 0
         self._lease_until = 0.0
+        self._session_owner: str | None = None
+        self._session_timeout = 300
+        self._session_until = 0.0
+        self._session_end_reason: str | None = None
         self._last_user = 0.0
         self._last_physical_event = 0.0  # Written before hook events enter the queue.
         self._last_move = 0.0
@@ -243,6 +247,79 @@ class ControlCoordinator:
         result = {"state": state, "generation": self._generation, "wait_seconds": wait}
         if self.immediate_capture or self._escape_cancelled:
             result.update(immediate_capture=self.immediate_capture, cancelled=self._escape_cancelled)
+        result["control_session"] = {
+            "active": self._session_owner is not None,
+            "timeout_seconds": self._session_timeout,
+            "remaining_seconds": max(0.0, self._session_until - now),
+            "end_reason": self._session_end_reason,
+        }
+        return result
+
+    def check_session_owner(self, owner: str | None) -> None:
+        """Bind a sustained capture to the server's MCP session, not tool arguments."""
+        with self._lock:
+            self._check_session_owner_locked(owner)
+
+    def _check_session_owner_locked(self, owner: str | None) -> None:
+        if self._session_owner is not None and owner != self._session_owner:
+            raise ControlBlocked("CONTROL_SESSION_BUSY", self._snapshot_locked(time.monotonic()))
+
+    def session_active(self) -> bool:
+        with self._lock:
+            return (self._session_owner is not None and self._state == "ai"
+                    and not self._escape_cancelled and not self._emergency
+                    and time.monotonic() < self._session_until)
+
+    def begin_session(self, owner: str | None, timeout_seconds: int = 300) -> dict:
+        if not owner:
+            raise ValueError("A live MCP session is required")
+        if type(timeout_seconds) is not int or not 30 <= timeout_seconds <= 900:
+            raise ValueError("timeout_seconds must be an integer from 30 to 900")
+        self.check_session_owner(owner)
+        token = current_token.get()
+        if token is None:
+            raise ValueError("ControlBegin must run through the desktop gate")
+        self.checkpoint(token)
+        with self._lock:
+            self._check_session_owner_locked(owner)
+            if self._escape_cancelled or self._fast_takeover:
+                raise ControlBlocked("USER_CANCELLED", self._snapshot_locked(time.monotonic()))
+            if not self.immediate_capture:
+                raise ControlBlocked("IMMEDIATE_CAPTURE_REQUIRED", self._snapshot_locked(time.monotonic()))
+            self._session_owner = owner
+            self._session_timeout = timeout_seconds
+            self._session_until = time.monotonic() + timeout_seconds
+            self._session_end_reason = None
+            self._trace('session_begin', 'explicit_begin')
+            return self._snapshot_locked(time.monotonic())
+
+    def keep_session(self, owner: str | None) -> dict:
+        self.status()  # Expire an abandoned session before trying to renew it.
+        self.check_session_owner(owner)
+        with self._lock:
+            self._check_session_owner_locked(owner)
+            if self._escape_cancelled or self._fast_takeover:
+                raise ControlBlocked("USER_CANCELLED", self._snapshot_locked(time.monotonic()))
+            if self._session_owner is None or self._state != "ai" or self._emergency:
+                raise ControlBlocked("NO_CONTROL_SESSION", self._snapshot_locked(time.monotonic()))
+            self._session_until = time.monotonic() + self._session_timeout
+            self._trace('session_renew', 'explicit_keepalive')
+            return self._snapshot_locked(time.monotonic())
+
+    def end_session(self, owner: str | None) -> dict:
+        self.check_session_owner(owner)
+        with self._lock:
+            self._check_session_owner_locked(owner)
+            changed = False
+            if self._session_owner is not None:
+                # Revoke the generation before releasing injected holds. An
+                # already running input step cannot continue on the old token.
+                changed = self._set_locked("user" if self._escape_cancelled else "ready",
+                                           'session_ended')
+                self._lease_until = 0.0
+            result = self._snapshot_locked(time.monotonic())
+        if changed:
+            self._notify(result)
         return result
 
     def resume_control(self) -> dict:
@@ -295,6 +372,10 @@ class ControlCoordinator:
         if state == self._state:
             return False
         self._state = state
+        if state not in ("ai", "takeover_pending") and self._session_owner is not None:
+            self._session_owner = None
+            self._session_until = 0.0
+            self._session_end_reason = reason
         if state != "ai":
             self.input_ledger.block_new()
         self._generation += 1
@@ -314,6 +395,11 @@ class ControlCoordinator:
     def _tick_locked(self, now: float) -> bool:
         if self._escape_cancelled:
             return False
+        if self._session_owner is not None and now >= self._session_until:
+            # Fail closed for automation, open for the human. A stale request
+            # must not immediately reacquire after the abandonment timeout.
+            self._escape_cancelled = True
+            return self._set_locked("user", 'session_timeout')
         if self._state == "ready" and now - self._last_physical_event < 10.0:
             self._last_user = self._last_physical_event
             return self._set_locked("user", 'recent_physical_input')
@@ -332,7 +418,8 @@ class ControlCoordinator:
             return self._set_locked(
                 "ai" if self._active_calls or now < self._lease_until else "ready", 'movement_candidate_idle'
             )
-        if self._state == "ai" and not self._active_calls and now >= self._lease_until:
+        if (self._state == "ai" and self._session_owner is None
+                and not self._active_calls and now >= self._lease_until):
             if now - self._last_physical_event < 10.0:
                 self._last_user = self._last_physical_event
                 return self._set_locked("user", 'lease_expired_with_physical_input')
@@ -340,10 +427,12 @@ class ControlCoordinator:
         return False
 
     def begin_call(self, name: str) -> int:
+        self.check_session_owner(current_owner.get())
         if self._emergency:
             self._mark_unavailable()
         now = time.monotonic()
         with self._lock:
+            self._check_session_owner_locked(current_owner.get())
             changed = self._set_locked("unavailable") if self._emergency else self._tick_locked(now)
             if self._escape_cancelled:
                 raise ControlBlocked("USER_CANCELLED", self._snapshot_locked(now))
@@ -370,6 +459,8 @@ class ControlCoordinator:
                 raise ControlBlocked("CONTROL_UNAVAILABLE", self._snapshot_locked(now)) from None
             changed = self._set_locked("ai", 'tool_begin') or changed
             self._active_calls += 1
+            if self._session_owner is not None:
+                self._session_until = now + self._session_timeout
             token = self._generation
             if self._active_calls == 1:
                 self._first_failure = None
@@ -449,6 +540,9 @@ class ControlCoordinator:
     def end_call(self, token: int) -> None:
         with self._lock:
             self._active_calls = max(0, self._active_calls - 1)
+            if (self._session_owner is not None and self._session_owner == current_owner.get()
+                    and token == self._generation and not self._escape_cancelled):
+                self._session_until = time.monotonic() + self._session_timeout
             if self._state in ("ai", "takeover_pending") and not self._active_calls:
                 self._lease_until = time.monotonic() + 15.0
             self._trace('lease_end', 'tool_returned')

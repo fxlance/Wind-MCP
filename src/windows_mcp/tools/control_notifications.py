@@ -201,6 +201,38 @@ class ControlToolGate(Middleware):
             raise
 
     async def on_call_tool(self, context: MiddlewareContext, call_next: Callable) -> Any:
+        from windows_mcp.desktop.control_context import current_owner
+        try:
+            owner = context.fastmcp_context.session_id
+            request = context.fastmcp_context.request_context
+            version = getattr(request, "protocol_version", None)
+            connection = getattr(context.fastmcp_context.session, "_connection", None)
+            if (isinstance(version, str) and version >= "2026-07-28"
+                    and not getattr(connection, "session_id", None)):
+                # The modern stateless transport creates a fresh connection
+                # per request. Its generated UUID is not a client identity.
+                owner = None
+        except (AttributeError, RuntimeError):
+            owner = None
+        if context.message.name == "ControlBegin" and not owner:
+            raise ToolError('PERSISTENT_SESSION_REQUIRED: use sessionful MCP (legacy transport)')
+        handle = current_owner.set(owner)
+        try:
+            return await self._owned_call(context, call_next)
+        except asyncio.CancelledError:
+            if owner:
+                try:
+                    end = getattr(self.controller, "end_session", None)
+                    if end:
+                        end(owner)
+                except Exception:
+                    # Another client's queued request cannot end the owner.
+                    logger.debug("Cancelled request did not own capture", exc_info=True)
+            raise
+        finally:
+            current_owner.reset(handle)
+
+    async def _owned_call(self, context: MiddlewareContext, call_next: Callable) -> Any:
         self.notifier.remember(context)
         name = context.message.name
         if name == "ControlStatus":
@@ -208,11 +240,28 @@ class ControlToolGate(Middleware):
         # Waiting behind an already running external command must not hide a
         # user takeover. Poll ownership while waiting, then recheck under lock.
         from windows_mcp.desktop.control import ControlBlocked
+        from windows_mcp.desktop.control_context import current_owner
+
+        def check_owner() -> None:
+            try:
+                checker = getattr(self.controller, "check_session_owner", None)
+                if checker:
+                    checker(current_owner.get())
+            except ControlBlocked as exc:
+                raise self._blocked(exc) from exc
+
+        if name in {"ControlEnd", "ControlKeepAlive"}:
+            check_owner()
+            try:
+                return await call_next(context)
+            except ControlBlocked as exc:
+                raise self._blocked(exc) from exc
 
         def reject_user_state() -> None:
             status = self.controller.status()
             if status.get("cancelled"):
                 raise self._blocked(ControlBlocked("USER_CANCELLED", status))
+            check_owner()
             if status["state"] == "user" and getattr(self.controller, "can_capture", lambda: False)():
                 return
             if status["state"] not in ("ready", "ai"):
@@ -233,6 +282,7 @@ class ControlToolGate(Middleware):
             except asyncio.TimeoutError:
                 reject_user_state()
         try:
+            check_owner()
             try:
                 token = await self._begin_call(name)
             except Exception as exc:

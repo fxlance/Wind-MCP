@@ -262,7 +262,7 @@ class RotationTests(unittest.TestCase):
                     run_id='11111111-1111-4111-8111-111111111111',
                     procedure_id='22222222-2222-4222-8222-222222222222'):
                 header = json.loads(path.read_text().splitlines()[0])
-                self.assertEqual(header['sdk_version'],'0.8.8+fxlance.2')
+                self.assertEqual(header['sdk_version'],'0.8.8+fxlance.3')
                 self.assertEqual(len(header['source_hashes']),4)
                 self.owner._begin_rotation('interval_elapsed')
                 self.owner._fail_open('indicator_unhealthy')
