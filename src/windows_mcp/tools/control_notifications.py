@@ -305,7 +305,8 @@ class ControlToolGate(Middleware):
                 # during begin_call's state notification.
                 self.controller.checkpoint(token)
                 if name in {"Click", "Type", "Scroll", "Move", "Shortcut", "Wait", "WaitFor",
-                            "Screenshot", "Snapshot", "MultiSelect", "MultiEdit", "Clipboard", "DisplayInventory"}:
+                            "Screenshot", "Snapshot", "HoverCapture", "MultiSelect", "MultiEdit",
+                            "Clipboard", "DisplayInventory"}:
                     worker = asyncio.create_task(call_next(context))
                     try:
                         while not worker.done():

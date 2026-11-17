@@ -53,6 +53,7 @@ EXPECTED_TOOLS = {
     "ControlEnd",
     "DisplayInventory",
     "FileSystem",
+    "HoverCapture",
     "Move",
     "MultiEdit",
     "MultiSelect",
